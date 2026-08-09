@@ -1,0 +1,5 @@
+inventory.db
+test_inventory.db
+*.db
+__pycache__/
+*.pyc
