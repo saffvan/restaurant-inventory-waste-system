@@ -1,24 +1,24 @@
 """
 engine.py
 ---------
-This is the "brain" of the app. It contains no UI code at all â€” just
+This is the "brain" of the app. It contains no UI code at all — just
 pure calculation functions that the Streamlit pages will call.
 
 Key concepts implemented here:
     1. Current Stock = SUM of quantity_remaining across all of an
        ingredient's batches. Opening stock is itself stored as a batch
        (created on the Ingredients page), so there is only ONE source
-       of truth for stock â€” the batches table. Earlier versions tracked
+       of truth for stock — the batches table. Earlier versions tracked
        opening stock separately from batches, which caused a "phantom
        stock" bug: the formula-based total didn't match what FEFO could
        actually see and deduct from.
     2. Reorder Point = Average Daily Usage x Reorder Period
     3. Waste Cost = sum of (quantity taken x that batch's unit cost)
-       across every batch a waste entry actually drew from â€” computed
+       across every batch a waste entry actually drew from — computed
        from batch_consumption records, not guessed from a single batch.
     4. FEFO (First-Expiring-First-Out): stock is consumed from the
        batch expiring soonest first. Cooking (Usage) additionally
-       EXCLUDES already-expired batches entirely â€” expired food should
+       EXCLUDES already-expired batches entirely — expired food should
        only ever be removed via Waste, never used in a recipe.
 """
 
@@ -50,11 +50,11 @@ def check_stock_available(ingredient_id, quantity_needed, exclude_expired=False,
     Checks if enough stock exists WITHOUT deducting anything.
 
     exclude_expired=True ignores batches whose expiry_date has already
-    passed â€” used by the Usage page so cooking never draws on expired
+    passed — used by the Usage page so cooking never draws on expired
     stock (a food-safety requirement, not just a data nicety).
 
     as_of_date lets the caller check expiry against a date other than
-    today (defaults to today_str() if not given) â€” needed when the user
+    today (defaults to today_str() if not given) — needed when the user
     is logging a Usage entry for a PAST date: a batch that's expired as
     of today may have still been perfectly fresh on that earlier date,
     and should be judged against the date it was actually used, not
@@ -93,12 +93,12 @@ def consume_stock_fefo(ingredient_id, quantity_needed, conn=None, source_type=No
     so the consumption order is deterministic rather than left to
     SQLite's unspecified ordering for equal keys.
 
-    exclude_expired=True skips already-expired batches entirely â€” used
+    exclude_expired=True skips already-expired batches entirely — used
     for Usage (cooking). Waste logging leaves this False, since waste
     is exactly where expired stock should go.
 
     as_of_date lets the caller judge "expired" against a date other
-    than today â€” see check_stock_available's docstring for why (a
+    than today — see check_stock_available's docstring for why (a
     Usage entry logged for a past date should be judged against that
     date, not today).
 
@@ -205,12 +205,12 @@ def get_actual_cost_for_source(source_type, source_id, conn=None):
     """
     Computes the TRUE cost of a usage/waste entry by looking at exactly
     which batches it drew from (batch_consumption) and each batch's
-    real unit_cost â€” instead of assuming the whole quantity came from
+    real unit_cost — instead of assuming the whole quantity came from
     a single batch's cost.
 
-    Example: 5kg wasted, 2kg from a batch bought at â‚¹200/kg and 3kg
-    from a batch bought at â‚¹300/kg -> true cost = (2x200)+(3x300) = â‚¹1300,
-    not 5x200 = â‚¹1000 (what a single-batch-cost assumption would give).
+    Example: 5kg wasted, 2kg from a batch bought at ₹200/kg and 3kg
+    from a batch bought at ₹300/kg -> true cost = (2x200)+(3x300) = ₹1300,
+    not 5x200 = ₹1000 (what a single-batch-cost assumption would give).
 
     Returns: (total_cost, total_quantity, weighted_avg_unit_cost)
     """
@@ -241,3 +241,206 @@ def get_actual_cost_for_source(source_type, source_id, conn=None):
     return round(total_cost, 2), round(total_quantity, 2), round(weighted_avg_unit_cost, 2)
 
 
+# ======================================================================
+# SECTION 3: CURRENT STOCK CALCULATION
+# ======================================================================
+
+def get_current_stock(ingredient_id, conn=None):
+    """
+    Current Stock = SUM of quantity_remaining across all batches
+    belonging to this ingredient.
+
+    Opening stock is created as a batch itself (see Ingredients page),
+    so batches are the single source of truth. This keeps "current
+    stock" always consistent with what FEFO can actually see and
+    deduct from — no separate formula that can drift out of sync.
+
+    Pass an existing `conn` to reuse a connection across many calls
+    (e.g. the Dashboard's per-ingredient reorder loop) instead of
+    opening/closing a new SQLite connection for every ingredient.
+    """
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COALESCE(SUM(quantity_remaining), 0) AS total
+        FROM batches
+        WHERE ingredient_id = ?
+    """, (ingredient_id,))
+    total = cur.fetchone()["total"]
+    if own_conn:
+        conn.close()
+    return round(total, 2)
+
+
+# ======================================================================
+# SECTION 4: REORDER POINT & STATUS
+# ======================================================================
+
+def get_average_daily_usage(ingredient_id, lookback_days=14, conn=None):
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+    cur = conn.cursor()
+    # Compute the cutoff in Python (local time) rather than SQLite's
+    # date('now', ...) (UTC), for the same timezone-consistency reason
+    # as check_stock_available / consume_stock_fefo above.
+    cutoff_date = (date.today() - timedelta(days=lookback_days)).isoformat()
+    cur.execute("""
+        SELECT COALESCE(SUM(quantity_used), 0) AS total
+        FROM usage_log
+        WHERE ingredient_id = ?
+          AND usage_date >= ?
+    """, (ingredient_id, cutoff_date))
+    total = cur.fetchone()["total"]
+    if own_conn:
+        conn.close()
+    return round(total / lookback_days, 2) if lookback_days > 0 else 0
+
+
+def get_reorder_status(ingredient_id, conn=None):
+    own_conn = False
+    if conn is None:
+        conn = get_connection()
+        own_conn = True
+    cur = conn.cursor()
+    cur.execute("SELECT reorder_period_days FROM ingredients WHERE ingredient_id = ?", (ingredient_id,))
+    row = cur.fetchone()
+    reorder_period = row["reorder_period_days"] if row else 7
+
+    avg_daily_usage = get_average_daily_usage(ingredient_id, conn=conn)
+    reorder_point = round(avg_daily_usage * reorder_period, 2)
+    current_stock = get_current_stock(ingredient_id, conn=conn)
+
+    if own_conn:
+        conn.close()
+
+    return {
+        "current_stock": current_stock,
+        "avg_daily_usage": avg_daily_usage,
+        "reorder_point": reorder_point,
+        "needs_reorder": current_stock <= reorder_point
+    }
+
+
+# ======================================================================
+# SECTION 5: EXPIRY CLASSIFICATION
+# ======================================================================
+
+def classify_batch_expiry(expiry_date_str, near_expiry_days, critical_expiry_days):
+    days_left = days_between(today_str(), expiry_date_str)
+
+    if days_left < 0:
+        return "Expired"
+    elif days_left <= critical_expiry_days:
+        return "Critical"
+    elif days_left <= near_expiry_days:
+        return "Near-Expiry"
+    else:
+        return "OK"
+
+
+def get_all_batches_with_status():
+    conn = get_connection()
+    query = """
+        SELECT
+            b.batch_id,
+            i.name AS ingredient_name,
+            c.name AS category_name,
+            i.unit,
+            b.purchase_date,
+            b.expiry_date,
+            b.quantity_remaining,
+            b.unit_cost,
+            c.near_expiry_days,
+            c.critical_expiry_days
+        FROM batches b
+        JOIN ingredients i ON b.ingredient_id = i.ingredient_id
+        JOIN categories c ON i.category_id = c.category_id
+        WHERE b.quantity_remaining > 0
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df["status"] = df.apply(
+        lambda row: classify_batch_expiry(
+            row["expiry_date"], row["near_expiry_days"], row["critical_expiry_days"]
+        ),
+        axis=1
+    )
+    return df
+
+
+# ======================================================================
+# SECTION 6: WASTE COST SUMMARY (for Dashboard)
+# ======================================================================
+
+def get_waste_summary():
+    conn = get_connection()
+    query = """
+        SELECT
+            w.waste_id,
+            i.name AS ingredient_name,
+            c.name AS category_name,
+            w.waste_date,
+            w.quantity_wasted,
+            w.reason,
+            w.unit_cost,
+            w.waste_cost
+        FROM waste_log w
+        JOIN ingredients i ON w.ingredient_id = i.ingredient_id
+        JOIN categories c ON i.category_id = c.category_id
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+def get_top_wasted_ingredients(limit=5):
+    waste_df = get_waste_summary()
+    if waste_df.empty:
+        return waste_df
+
+    ranked = (
+        waste_df.groupby("ingredient_name")
+        .agg(total_quantity_wasted=("quantity_wasted", "sum"), total_waste_cost=("waste_cost", "sum"))
+        .reset_index()
+        .sort_values("total_waste_cost", ascending=False)
+        .head(limit)
+    )
+    return ranked
+
+
+def get_dashboard_summary():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT ingredient_id FROM ingredients")
+    ingredient_ids = [row["ingredient_id"] for row in cur.fetchall()]
+
+    total_waste_df = get_waste_summary()
+    total_waste_cost = round(total_waste_df["waste_cost"].sum(), 2) if not total_waste_df.empty else 0
+
+    # Reuse this one connection for every ingredient's reorder check
+    # instead of get_reorder_status opening (and closing) its own
+    # connection per ingredient — avoids N separate SQLite connections
+    # for what's otherwise a handful of small queries.
+    reorder_needed_count = 0
+    for iid in ingredient_ids:
+        status = get_reorder_status(iid, conn=conn)
+        if status["needs_reorder"]:
+            reorder_needed_count += 1
+
+    conn.close()
+
+    return {
+        "total_ingredients": len(ingredient_ids),
+        "total_waste_cost": total_waste_cost,
+        "reorder_needed_count": reorder_needed_count
+    }
